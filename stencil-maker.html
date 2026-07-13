@@ -29,6 +29,11 @@
   .control{display:flex; flex-direction:column; gap:6px; min-width:220px; flex:1;}
   .control label{font-size:13px; color:var(--muted); display:flex; justify-content:space-between;}
   .control input[type=range]{width:100%;}
+  .control.checkbox-row{flex-direction:row; align-items:flex-start; gap:10px; min-width:auto; flex:0 0 auto;}
+  .control.checkbox-row input[type=checkbox]{width:18px; height:18px; margin-top:2px; accent-color:var(--accent); cursor:pointer; flex-shrink:0;}
+  .control.checkbox-row label{display:flex; flex-direction:column; gap:2px; cursor:pointer; text-align:left;}
+  .control.checkbox-row label span.title{color:var(--text); font-size:13px; font-weight:600;}
+  .control.checkbox-row label span.hint{font-size:11px; color:var(--muted); font-weight:400;}
   button{
     background:var(--accent); color:#fff; border:none; border-radius:8px; padding:10px 16px;
     font-size:14px; cursor:pointer; font-weight:600;
@@ -72,6 +77,13 @@
           <label><span>Despeckle / edge smoothing (fewer tiny islands to cut)</span><span id="despeckleVal">4</span></label>
           <input type="range" id="despeckle" min="0" max="12" value="4">
         </div>
+        <div class="control checkbox-row">
+          <input type="checkbox" id="subjectOnly">
+          <label for="subjectOnly">
+            <span class="title">Subject only</span>
+            <span class="hint">Auto-removes the background and stencils just the subject. First use downloads a small AI model (needs internet once).</span>
+          </label>
+        </div>
         <button id="reprocess">Re-render preview</button>
       </div>
       <div class="status" id="status"></div>
@@ -98,7 +110,7 @@
         <button id="downloadLayer2" class="secondary">Download layer 3 mask</button>
       </div>
       <div class="note">
-        Layer masks are black-on-white cutouts of just that one color's regions — print one per layer if you're cutting a multi-layer stencil, or use the combined PNG if you're cutting all colors from a single sheet with different techniques (paint fill, etc). Higher despeckle values remove small floating islands and thin slivers, which are the hardest part to cut cleanly.
+        Layer masks are black-on-white cutouts of just that one color's regions — print one per layer if you're cutting a multi-layer stencil, or use the combined PNG if you're cutting all colors from a single sheet with different techniques (paint fill, etc). Higher despeckle values remove small floating islands and thin slivers, which are the hardest part to cut cleanly. "Subject only" runs an AI model fully in your browser to cut out the background automatically — nothing is uploaded anywhere; the model just has to download once.
       </div>
     </div>
   </div>
@@ -127,17 +139,30 @@
   const downloadFullBtn = document.getElementById('downloadFull');
   const layerBtns = [document.getElementById('downloadLayer0'), document.getElementById('downloadLayer1'), document.getElementById('downloadLayer2')];
   const hiddenLink = document.getElementById('hiddenLink');
+  const subjectToggle = document.getElementById('subjectOnly');
 
   const K = 3;
   const PREVIEW_MAX_DIM = 640;
   const FULL_MAX_DIM = 2600;
+  const MASK_THRESHOLD = 128; // alpha value above which a pixel counts as "subject"
+  const BG_MODEL_URL = 'https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.7.0/dist/index.mjs';
 
   let fullImageData = null;   // ImageData at (capped) full resolution
   let previewImageData = null; // ImageData at preview resolution
   let lastCentroids = null;   // [[r,g,b], ...] sorted by luminance
   let lastPreviewLabels = null;
+  let fullMask = null;        // Uint8Array alpha mask (0-255) aligned to fullImageData, or null
+  let previewMask = null;     // Uint8Array alpha mask aligned to previewImageData, or null
+  let isSegmenting = false;
 
   function setStatus(msg){ statusEl.textContent = msg || ''; }
+
+  function setBusy(busy){
+    reprocessBtn.disabled = busy;
+    downloadFullBtn.disabled = busy;
+    layerBtns.forEach(b => b.disabled = busy);
+    subjectToggle.disabled = busy;
+  }
 
   // ---------- file loading ----------
   dropzone.addEventListener('click', () => fileInput.click());
@@ -187,7 +212,90 @@
     origCanvas.width = pw; origCanvas.height = ph;
     origCanvas.getContext('2d').putImageData(previewImageData, 0, 0);
 
-    process();
+    fullMask = null;
+    previewMask = null;
+
+    if (subjectToggle.checked){
+      runSubjectExtraction();
+    } else {
+      process();
+    }
+  }
+
+  // ---------- subject extraction (background removal) ----------
+  async function runSubjectExtraction(){
+    if (!fullImageData || isSegmenting) return;
+    isSegmenting = true;
+    setBusy(true);
+    setStatus('Loading subject-detection model… (first use downloads it, needs internet)');
+    try {
+      const mod = await import(BG_MODEL_URL);
+      const removeBackground = mod.removeBackground || mod.default;
+
+      const srcBlob = await new Promise(resolve => fullWorkCanvas.toBlob(resolve, 'image/png'));
+      const resultBlob = await removeBackground(srcBlob, {
+        device: 'cpu',
+        model: 'isnet_quint8',
+        progress: (key, current, total) => {
+          const pct = total ? Math.round(100 * current / total) : 0;
+          setStatus('Detecting subject… ' + key + ' ' + pct + '%');
+        }
+      });
+
+      const bmp = await createImageBitmap(resultBlob);
+
+      // full-resolution alpha mask
+      const fw = fullWorkCanvas.width, fh = fullWorkCanvas.height;
+      const mc = document.createElement('canvas');
+      mc.width = fw; mc.height = fh;
+      mc.getContext('2d').drawImage(bmp, 0, 0, fw, fh);
+      const fData = mc.getContext('2d').getImageData(0, 0, fw, fh).data;
+      fullMask = new Uint8Array(fw * fh);
+      for (let i = 0; i < fullMask.length; i++) fullMask[i] = fData[i * 4 + 3];
+
+      // preview-resolution alpha mask
+      const pw = previewImageData.width, ph = previewImageData.height;
+      const pc = document.createElement('canvas');
+      pc.width = pw; pc.height = ph;
+      pc.getContext('2d').drawImage(bmp, 0, 0, pw, ph);
+      const pData = pc.getContext('2d').getImageData(0, 0, pw, ph).data;
+      previewMask = new Uint8Array(pw * ph);
+      for (let i = 0; i < previewMask.length; i++) previewMask[i] = pData[i * 4 + 3];
+
+      setStatus('Subject detected. Rendering stencil…');
+      isSegmenting = false;
+      setBusy(false);
+      process();
+    } catch (err){
+      console.error(err);
+      isSegmenting = false;
+      setBusy(false);
+      fullMask = null; previewMask = null;
+      setStatus('Subject detection failed (' + err.message + '). Turn off "Subject only" or try a different photo.');
+      process();
+    }
+  }
+
+  function sampleColorsMasked(data, width, height, maxSamples, mask, threshold){
+    const total = width * height;
+    const indices = [];
+    for (let i = 0; i < total; i++){
+      if (mask[i] > threshold) indices.push(i);
+    }
+    if (indices.length === 0) return [];
+    const stride = Math.max(1, Math.floor(indices.length / maxSamples));
+    const samples = [];
+    for (let j = 0; j < indices.length; j += stride){
+      const o = indices[j] * 4;
+      samples.push([data[o], data[o+1], data[o+2]]);
+    }
+    return samples;
+  }
+
+  function applyAlphaMask(imageData, mask, threshold){
+    for (let i = 0; i < mask.length; i++){
+      if (mask[i] <= threshold) imageData.data[i * 4 + 3] = 0;
+    }
   }
 
   // ---------- image processing primitives ----------
@@ -368,34 +476,47 @@
     const blurRadius = parseInt(blurSlider.value, 10);
     const despeckleIters = parseInt(despeckleSlider.value, 10);
 
+    const useMask = subjectToggle.checked && previewMask;
+
     const blurred = boxBlur(previewImageData.data, width, height, blurRadius);
-    const samples = sampleColors(blurred, width, height, 6000);
+    let samples = useMask
+      ? sampleColorsMasked(blurred, width, height, 6000, previewMask, MASK_THRESHOLD)
+      : sampleColors(blurred, width, height, 6000);
+    if (samples.length < K) samples = sampleColors(blurred, width, height, 6000);
     const centroids = kmeans(samples, K, 8).sort((a,b) => luminance(a) - luminance(b));
 
     let labels = classify(blurred, width, height, centroids);
     labels = majorityFilter(labels, width, height, K, despeckleIters);
 
     const outData = labelsToImageData(labels, centroids, width, height);
+    if (useMask) applyAlphaMask(outData, previewMask, MASK_THRESHOLD);
     resultCanvas.width = width; resultCanvas.height = height;
     resultCanvas.getContext('2d').putImageData(outData, 0, 0);
 
     lastCentroids = centroids;
     lastPreviewLabels = labels;
-    renderSwatches(labels, centroids);
-    setStatus('Preview updated. Adjust sliders and click "Re-render preview", or download below.');
+    renderSwatches(labels, centroids, useMask ? previewMask : null);
+    setStatus(useMask
+      ? 'Preview updated (background removed). Adjust sliders or download below.'
+      : 'Preview updated. Adjust sliders and click "Re-render preview", or download below.');
   }
 
-  function renderSwatches(labels, centroids){
+  function renderSwatches(labels, centroids, mask){
     const counts = new Array(centroids.length).fill(0);
-    for (let i = 0; i < labels.length; i++) counts[labels[i]]++;
-    const total = labels.length;
+    let total = 0;
+    for (let i = 0; i < labels.length; i++){
+      if (mask && mask[i] <= MASK_THRESHOLD) continue;
+      counts[labels[i]]++;
+      total++;
+    }
+    if (total === 0) total = labels.length;
     swatchesEl.innerHTML = '';
     centroids.forEach((c, idx) => {
       const pct = (100 * counts[idx] / total).toFixed(1);
       const div = document.createElement('div');
       div.className = 'swatch';
       div.innerHTML = '<div class="chip" style="background:' + rgbToHex(c) + '"></div>' +
-        '<div class="info"><b>Layer ' + (idx+1) + '</b><br>' + rgbToHex(c) + ' · ' + pct + '% of image</div>';
+        '<div class="info"><b>Layer ' + (idx+1) + '</b><br>' + rgbToHex(c) + ' · ' + pct + '% of subject</div>';
       swatchesEl.appendChild(div);
     });
   }
@@ -403,6 +524,14 @@
   blurSlider.addEventListener('input', () => { blurVal.textContent = blurSlider.value; });
   despeckleSlider.addEventListener('input', () => { despeckleVal.textContent = despeckleSlider.value; });
   reprocessBtn.addEventListener('click', process);
+  subjectToggle.addEventListener('change', () => {
+    if (!fullImageData) return;
+    if (subjectToggle.checked && !fullMask){
+      runSubjectExtraction();
+    } else {
+      process();
+    }
+  });
 
   // ---------- full-resolution export ----------
   function buildFullResLabels(){
@@ -427,10 +556,12 @@
 
   downloadFullBtn.addEventListener('click', () => {
     if (!lastCentroids) return;
+    const useMask = subjectToggle.checked && fullMask;
     setStatus('Rendering full-resolution stencil… this can take a few seconds.');
     setTimeout(() => {
       const { labels, width, height } = buildFullResLabels();
       const outData = labelsToImageData(labels, lastCentroids, width, height);
+      if (useMask) applyAlphaMask(outData, fullMask, MASK_THRESHOLD);
       const c = document.createElement('canvas');
       c.width = width; c.height = height;
       c.getContext('2d').putImageData(outData, 0, 0);
@@ -442,12 +573,14 @@
   layerBtns.forEach((btn, idx) => {
     btn.addEventListener('click', () => {
       if (!lastCentroids) return;
+      const useMask = subjectToggle.checked && fullMask;
       setStatus('Rendering layer ' + (idx+1) + ' mask… this can take a few seconds.');
       setTimeout(() => {
         const { labels, width, height } = buildFullResLabels();
         const out = new ImageData(width, height);
         for (let i = 0; i < width * height; i++){
-          const isLayer = labels[i] === idx;
+          const outsideSubject = useMask && fullMask[i] <= MASK_THRESHOLD;
+          const isLayer = labels[i] === idx && !outsideSubject;
           const v = isLayer ? 0 : 255;
           const o = i * 4;
           out.data[o] = v; out.data[o+1] = v; out.data[o+2] = v; out.data[o+3] = 255;
