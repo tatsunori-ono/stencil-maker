@@ -51,6 +51,7 @@
   .swatch .info b{font-size:13px;}
   .downloads{display:flex; gap:10px; flex-wrap:wrap; margin-top:18px;}
   .status{font-size:13px; color:var(--muted); margin-top:10px; min-height:18px;}
+  .status.error{color:#ff6b6b; font-weight:600;}
   .hidden{display:none !important;}
   a.hiddenlink{display:none;}
   .note{font-size:12px; color:var(--muted); margin-top:14px; line-height:1.5;}
@@ -81,7 +82,7 @@
           <input type="checkbox" id="subjectOnly">
           <label for="subjectOnly">
             <span class="title">Subject only</span>
-            <span class="hint">Auto-removes the background and stencils just the subject. First use downloads a small AI model (needs internet once).</span>
+            <span class="hint">Auto-removes the background and stencils just the subject. First use downloads an AI model (~80MB, needs internet once, then cached by the browser).</span>
           </label>
         </div>
         <button id="reprocess">Re-render preview</button>
@@ -155,7 +156,8 @@
   let previewMask = null;     // Uint8Array alpha mask aligned to previewImageData, or null
   let isSegmenting = false;
 
-  function setStatus(msg){ statusEl.textContent = msg || ''; }
+  function setStatus(msg){ statusEl.classList.remove('error'); statusEl.textContent = msg || ''; }
+  function setStatusError(msg){ statusEl.classList.add('error'); statusEl.textContent = msg || ''; }
 
   function setBusy(busy){
     reprocessBtn.disabled = busy;
@@ -227,22 +229,34 @@
     if (!fullImageData || isSegmenting) return;
     isSegmenting = true;
     setBusy(true);
-    setStatus('Loading subject-detection model… (first use downloads it, needs internet)');
+    setStatus('Loading subject-detection model… (first use downloads it, needs internet, ~80MB cached by the browser)');
     try {
       const mod = await import(BG_MODEL_URL);
       const removeBackground = mod.removeBackground || mod.default;
+      if (typeof removeBackground !== 'function'){
+        throw new Error('background-removal library did not load correctly (no removeBackground export)');
+      }
 
-      const srcBlob = await new Promise(resolve => fullWorkCanvas.toBlob(resolve, 'image/png'));
+      const srcBlob = await new Promise((resolve, reject) => {
+        fullWorkCanvas.toBlob(b => b ? resolve(b) : reject(new Error('could not encode source image')), 'image/png');
+      });
+
       const resultBlob = await removeBackground(srcBlob, {
         device: 'cpu',
-        model: 'isnet_quint8',
+        model: 'isnet_fp16',
+        proxyToWorker: false,
         progress: (key, current, total) => {
           const pct = total ? Math.round(100 * current / total) : 0;
           setStatus('Detecting subject… ' + key + ' ' + pct + '%');
         }
       });
 
+      if (!resultBlob || resultBlob.size === 0){
+        throw new Error('model returned an empty result');
+      }
+
       const bmp = await createImageBitmap(resultBlob);
+      console.log('[stencil-maker] segmentation result size', bmp.width, 'x', bmp.height, 'expected', fullWorkCanvas.width, 'x', fullWorkCanvas.height);
 
       // full-resolution alpha mask
       const fw = fullWorkCanvas.width, fh = fullWorkCanvas.height;
@@ -250,8 +264,20 @@
       mc.width = fw; mc.height = fh;
       mc.getContext('2d').drawImage(bmp, 0, 0, fw, fh);
       const fData = mc.getContext('2d').getImageData(0, 0, fw, fh).data;
-      fullMask = new Uint8Array(fw * fh);
-      for (let i = 0; i < fullMask.length; i++) fullMask[i] = fData[i * 4 + 3];
+      const newFullMask = new Uint8Array(fw * fh);
+      let subjectCount = 0;
+      for (let i = 0; i < newFullMask.length; i++){
+        newFullMask[i] = fData[i * 4 + 3];
+        if (newFullMask[i] > MASK_THRESHOLD) subjectCount++;
+      }
+      const subjectFraction = subjectCount / newFullMask.length;
+      console.log('[stencil-maker] subject coverage:', (subjectFraction * 100).toFixed(1) + '%');
+
+      if (subjectFraction < 0.01){
+        throw new Error('almost nothing was detected as the subject (' + (subjectFraction*100).toFixed(1) + '% of the image) — the photo may be too low-contrast for auto-detection');
+      }
+
+      fullMask = newFullMask;
 
       // preview-resolution alpha mask
       const pw = previewImageData.width, ph = previewImageData.height;
@@ -262,16 +288,16 @@
       previewMask = new Uint8Array(pw * ph);
       for (let i = 0; i < previewMask.length; i++) previewMask[i] = pData[i * 4 + 3];
 
-      setStatus('Subject detected. Rendering stencil…');
       isSegmenting = false;
       setBusy(false);
+      setStatus('Subject detected (' + (subjectFraction*100).toFixed(0) + '% of frame). Rendering stencil…');
       process();
     } catch (err){
-      console.error(err);
+      console.error('[stencil-maker] subject extraction failed:', err);
       isSegmenting = false;
       setBusy(false);
       fullMask = null; previewMask = null;
-      setStatus('Subject detection failed (' + err.message + '). Turn off "Subject only" or try a different photo.');
+      setStatusError('Subject detection failed: ' + err.message + '. Showing the full photo instead — check the browser console for details, or try again.');
       process();
     }
   }
