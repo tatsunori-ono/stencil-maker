@@ -32,6 +32,7 @@
     background:var(--panel); border:1px solid var(--border); border-radius:12px;
     padding:18px 20px; margin-top:18px;
   }
+  .panel h2{font-size:13px; color:var(--muted); font-weight:600; margin:0 0 12px; text-transform:uppercase; letter-spacing:.04em;}
   .controls{display:flex; flex-wrap:wrap; gap:24px; align-items:flex-end;}
   .control{display:flex; flex-direction:column; gap:6px; min-width:220px; flex:1;}
   .control label{font-size:13px; color:var(--muted); display:flex; justify-content:space-between;}
@@ -62,12 +63,25 @@
   .hidden{display:none !important;}
   a.hiddenlink{display:none;}
   .note{font-size:12px; color:var(--muted); margin-top:14px; line-height:1.5;}
+  .contact-sheet{display:flex; gap:12px; flex-wrap:wrap;}
+  .palette-tile{
+    border:2px solid var(--border); border-radius:10px; padding:6px; cursor:pointer;
+    background:#1e2126; transition:border-color .15s; width:150px;
+  }
+  .palette-tile:hover{border-color:#5b8def88;}
+  .palette-tile.selected{border-color:var(--accent);}
+  .palette-tile canvas{width:100%; height:auto; border-radius:6px; display:block; background:repeating-conic-gradient(#2a2d33 0% 25%, #232529 0% 50%) 50% / 14px 14px;}
+  .palette-tile-label{font-size:12px; color:var(--muted); text-align:center; margin-top:6px;}
+  .hue-fine{display:flex; align-items:center; gap:12px; margin-top:16px;}
+  .hue-fine label{font-size:13px; color:var(--muted); white-space:nowrap;}
+  .hue-fine input[type=range]{flex:1;}
+  .hue-fine .hue-readout{font-size:13px; color:var(--text); min-width:48px; text-align:right;}
 </style>
 </head>
 <body>
 <div class="app">
   <h1>Stencil Maker</h1>
-  <p class="sub">Turn a photo into a clean 3-color stencil. Auto-picks the 3 best colors, smooths out noise, and merges tiny speckles so it's actually cuttable.</p>
+  <p class="sub">Turn a photo into a clean 3-color stencil. Perceptual (OKLab) tone separation finds the shapes; auto-hue is just a starting guess — pick the palette that actually looks right from the contact sheet.</p>
 
   <div class="dropzone" id="dropzone">
     <div><strong>Click to choose a photo</strong>, or drag &amp; drop one here.</div>
@@ -78,12 +92,12 @@
     <div class="panel">
       <div class="controls">
         <div class="control">
-          <label><span>Pre-smoothing (removes photo noise/texture)</span><span id="blurVal">3</span></label>
-          <input type="range" id="blur" min="0" max="14" value="3">
+          <label><span>Smoothing (kills texture, makes chunky bands)</span><span id="smoothVal">4</span></label>
+          <input type="range" id="smooth" min="0" max="10" value="4">
         </div>
         <div class="control">
-          <label><span>Despeckle / edge smoothing (fewer tiny islands to cut)</span><span id="despeckleVal">4</span></label>
-          <input type="range" id="despeckle" min="0" max="12" value="4">
+          <label><span>Shape cleanup (removes tiny islands &amp; fills small holes)</span><span id="despeckleVal">2</span></label>
+          <input type="range" id="despeckle" min="0" max="5" value="2">
         </div>
         <div class="control checkbox-row">
           <input type="checkbox" id="subjectOnly">
@@ -92,9 +106,19 @@
             <span class="hint">Auto-removes the background and stencils just the subject. First use downloads an AI model (~80MB, needs internet once, then cached by the browser).</span>
           </label>
         </div>
-        <button id="reprocess">Re-render preview</button>
+        <button id="reprocess">Re-analyse photo</button>
       </div>
       <div class="status" id="status"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Pick a palette</h2>
+      <div class="contact-sheet" id="contactSheet"></div>
+      <div class="hue-fine">
+        <label for="hueSlider">Fine-tune hue</label>
+        <input type="range" id="hueSlider" min="0" max="359" value="210">
+        <span class="hue-readout" id="hueVal">210°</span>
+      </div>
     </div>
 
     <div class="canvases">
@@ -113,12 +137,12 @@
     <div class="panel">
       <div class="downloads">
         <button id="downloadFull">Download full-resolution stencil (PNG)</button>
-        <button id="downloadLayer0" class="secondary">Download layer 1 mask</button>
-        <button id="downloadLayer1" class="secondary">Download layer 2 mask</button>
-        <button id="downloadLayer2" class="secondary">Download layer 3 mask</button>
+        <button id="downloadLayer0" class="secondary">Download layer 1 mask (dark)</button>
+        <button id="downloadLayer1" class="secondary">Download layer 2 mask (mid)</button>
+        <button id="downloadLayer2" class="secondary">Download layer 3 mask (light)</button>
       </div>
       <div class="note">
-        Layer masks are black-on-white cutouts of just that one color's regions — print one per layer if you're cutting a multi-layer stencil, or use the combined PNG if you're cutting all colors from a single sheet with different techniques (paint fill, etc). Higher despeckle values remove small floating islands and thin slivers, which are the hardest part to cut cleanly. "Subject only" runs an AI model fully in your browser to cut out the background automatically — nothing is uploaded anywhere; the model just has to download once.
+        Layer masks are black-on-white cutouts of just that one band's regions — print one per layer if you're cutting a multi-layer stencil. The dark and mid bands are cut from the photo's shadow structure, not from raw color, so shapes stay chunky and cuttable. "Subject only" removes the background before any of this runs — nothing is uploaded anywhere, the AI model just has to download once. Auto-hue is a starting guess (skin and warm wood dominate most photos and throw it off); use the contact sheet or the hue slider to pick what actually looks right.
       </div>
     </div>
   </div>
@@ -126,9 +150,403 @@
 
 <canvas id="fullWorkCanvas" class="hidden"></canvas>
 <canvas id="previewWorkCanvas" class="hidden"></canvas>
+<canvas id="hueThumbCanvas" class="hidden"></canvas>
 <a id="hiddenLink" class="hiddenlink"></a>
 
 <script>
+// ============================================================================
+// Color / tone-separation engine (ported from tricolour.py — OKLab palette
+// rules, 3-class Otsu thresholding, morphological cleanup).
+// ============================================================================
+
+function srgbToLinear1(c){
+  c = c / 255;
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+function linearToSrgb1(c){
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(Math.max(c, 0), 1/2.4) - 0.055;
+}
+function rgbToOklab1(r, g, b){
+  const lr = srgbToLinear1(r), lg = srgbToLinear1(g), lb = srgbToLinear1(b);
+  const l = 0.4122214708*lr + 0.5363325363*lg + 0.0514459929*lb;
+  const m = 0.2119034982*lr + 0.6806995451*lg + 0.1073969566*lb;
+  const s = 0.0883024619*lr + 0.2817188376*lg + 0.6299787005*lb;
+  const l_ = Math.cbrt(Math.max(l, 0));
+  const m_ = Math.cbrt(Math.max(m, 0));
+  const s_ = Math.cbrt(Math.max(s, 0));
+  return [
+    0.2104542553*l_ + 0.7936177850*m_ - 0.0040720468*s_,
+    1.9779984951*l_ - 2.4285922050*m_ + 0.4505937099*s_,
+    0.0259040371*l_ + 0.7827717662*m_ - 0.8086757660*s_
+  ];
+}
+function oklabToRgb1(L, a, b){
+  const l_ = L + 0.3963377774*a + 0.2158037573*b;
+  const m_ = L - 0.1055613458*a - 0.0638541728*b;
+  const s_ = L - 0.0894841775*a - 1.2914855480*b;
+  const l = l_*l_*l_, m = m_*m_*m_, s = s_*s_*s_;
+  const lr =  4.0767416621*l - 3.3077115913*m + 0.2309699292*s;
+  const lg = -1.2684380046*l + 2.6097574011*m - 0.3413193965*s;
+  const lb = -0.0041960863*l - 0.7034186147*m + 1.7076147010*s;
+  return [linearToSrgb1(lr), linearToSrgb1(lg), linearToSrgb1(lb)];
+}
+function oklchToRgbFloat(L, C, hueDeg){
+  const h = hueDeg * Math.PI / 180;
+  return oklabToRgb1(L, C*Math.cos(h), C*Math.sin(h));
+}
+function oklchToRgb255(L, C, hueDeg, maxIter=64){
+  let c = C;
+  for (let i=0;i<maxIter;i++){
+    const [r,g,b] = oklchToRgbFloat(L, c, hueDeg);
+    if (r>=-1e-4 && r<=1+1e-4 && g>=-1e-4 && g<=1+1e-4 && b>=-1e-4 && b<=1+1e-4) break;
+    c *= 0.94;
+  }
+  const [r,g,b] = oklchToRgbFloat(L, c, hueDeg);
+  const clamp255 = v => Math.max(0, Math.min(255, Math.round(v*255)));
+  return [clamp255(r), clamp255(g), clamp255(b)];
+}
+function shiftTowardBlue(h, amount){
+  const BLUE = 264.0;
+  const diff = (((BLUE - h + 180) % 360 + 360) % 360) - 180;
+  const delta = Math.sign(diff) * Math.min(Math.abs(diff), amount);
+  return ((h + delta) % 360 + 360) % 360;
+}
+
+const DEFAULT_SPEC = {
+  darkL: 0.24, darkC: 0.045, darkHueShift: 45.0,
+  midL: 0.62, midC: 0.145,
+  lightL: 0.93, lightC: 0.030, lightHue: 78.0,
+  minDeltaL: 0.25
+};
+
+function buildPalette(hue, spec=DEFAULT_SPEC){
+  if (hue === null || hue === undefined) hue = 210.0;
+  let midL = spec.midL, midC = spec.midC;
+  const dist = Math.abs((((hue - 95 + 180) % 360 + 360) % 360) - 180);
+  if (dist < 40){
+    const k = 1.0 - dist/40.0;
+    midL -= 0.11*k;
+    midC += 0.015*k;
+  }
+  const darkHue = shiftTowardBlue(hue, spec.darkHueShift);
+  const L = [spec.darkL, midL, spec.lightL];
+  for (const i of [1,2]){
+    if (L[i] - L[i-1] < spec.minDeltaL) L[i] = L[i-1] + spec.minDeltaL;
+  }
+  L[2] = Math.min(L[2], 0.95);
+  return [
+    oklchToRgb255(L[0], spec.darkC, darkHue),
+    oklchToRgb255(L[1], midC, hue),
+    oklchToRgb255(L[2], spec.lightC, spec.lightHue)
+  ];
+}
+
+function contactHueList(baseHue){
+  const b = (baseHue === null || baseHue === undefined) ? 210.0 : baseHue;
+  return [0,30,-30,120,180,240].map(r => ((b + r) % 360 + 360) % 360);
+}
+
+const SKIN_LO = 18.0, SKIN_HI = 70.0;
+
+function accentHueFromSamples(samples, {satPercentile=82, skinDamp=0.15, bins=36} = {}){
+  if (samples.length < 32) return null;
+  const chromas = samples.map(s => s.chroma).slice().sort((a,b) => a-b);
+  const pctIdx = Math.min(chromas.length-1, Math.floor(satPercentile/100 * chromas.length));
+  const thr = Math.max(chromas[pctIdx], 5e-3);
+  const kept = samples.filter(s => s.chroma >= thr);
+  if (kept.length < 32) return null;
+
+  const hist = new Float64Array(bins);
+  const binWidth = 360/bins;
+  for (const s of kept){
+    let wgt = Math.pow(s.chroma, 1.5);
+    if (s.hue >= SKIN_LO && s.hue <= SKIN_HI) wgt *= skinDamp;
+    const bin = Math.floor(s.hue / binWidth) % bins;
+    hist[bin] += wgt;
+  }
+  const kernel = [1,2,3,2,1];
+  const smoothed = new Float64Array(bins);
+  for (let i=0;i<bins;i++){
+    let sum = 0;
+    for (let k=-2;k<=2;k++){
+      const idx = ((i+k) % bins + bins) % bins;
+      sum += hist[idx] * kernel[k+2];
+    }
+    smoothed[i] = sum;
+  }
+  let maxV = -Infinity, maxI = 0;
+  for (let i=0;i<bins;i++){ if (smoothed[i] > maxV){ maxV = smoothed[i]; maxI = i; } }
+  if (maxV <= 0) return null;
+  const y0 = smoothed[(maxI-1+bins)%bins], y1 = smoothed[maxI], y2 = smoothed[(maxI+1)%bins];
+  const denom = y0 - 2*y1 + y2;
+  const delta = Math.abs(denom) > 1e-9 ? 0.5*(y0-y2)/denom : 0.0;
+  return ((maxI + delta + 0.5) * binWidth % 360 + 360) % 360;
+}
+
+function buildHueSamples(rgbaData, width, height, {x0=0,y0=0,x1=width,y1=height, maskArr=null, maskThreshold=128} = {}){
+  const samples = [];
+  for (let y=y0; y<y1; y++){
+    for (let x=x0; x<x1; x++){
+      const i = y*width + x;
+      if (maskArr && maskArr[i] <= maskThreshold) continue;
+      const o = i*4;
+      const [L,a,b] = rgbToOklab1(rgbaData[o], rgbaData[o+1], rgbaData[o+2]);
+      const chroma = Math.hypot(a,b);
+      const hue = ((Math.atan2(b,a)*180/Math.PI) % 360 + 360) % 360;
+      samples.push({chroma, hue});
+    }
+  }
+  return samples;
+}
+
+function computeGray(rgbaData, width, height){
+  const n = width*height;
+  const gray = new Uint8ClampedArray(n);
+  for (let i=0;i<n;i++){
+    const o = i*4;
+    gray[i] = Math.round(0.299*rgbaData[o] + 0.587*rgbaData[o+1] + 0.114*rgbaData[o+2]);
+  }
+  return gray;
+}
+
+function grayHistogram(gray, maskArr=null, maskThreshold=128){
+  const hist = new Float64Array(256);
+  let total = 0;
+  for (let i=0;i<gray.length;i++){
+    if (maskArr && maskArr[i] <= maskThreshold) continue;
+    hist[gray[i]]++; total++;
+  }
+  if (total === 0){
+    for (let i=0;i<gray.length;i++) hist[gray[i]]++;
+    total = gray.length;
+  }
+  return {hist, total};
+}
+
+function percentileFromHist(hist, total, pct){
+  const target = pct/100 * total;
+  let cum = 0;
+  for (let v=0; v<256; v++){
+    cum += hist[v];
+    if (cum >= target) return v;
+  }
+  return 255;
+}
+
+function otsu3FromHist(hist, total){
+  const p = new Float64Array(256);
+  for (let i=0;i<256;i++) p[i] = hist[i]/total;
+  const w = new Float64Array(256), m = new Float64Array(256);
+  let cw=0, cm=0;
+  for (let i=0;i<256;i++){ cw += p[i]; cm += p[i]*i; w[i]=cw; m[i]=cm; }
+  const mt = m[255];
+  let bestVar = -1, bt1 = 85, bt2 = 170;
+  for (let t1=1; t1<254; t1++){
+    for (let t2=t1+1; t2<255; t2++){
+      const w0 = w[t1], w1 = w[t2]-w[t1], w2 = 1.0-w[t2];
+      if (Math.min(w0,w1,w2) < 1e-6) continue;
+      const m0 = m[t1]/w0, m1 = (m[t2]-m[t1])/w1, m2 = (mt-m[t2])/w2;
+      const varr = w0*(m0-mt)**2 + w1*(m1-mt)**2 + w2*(m2-mt)**2;
+      if (varr > bestVar){ bestVar = varr; bt1 = t1; bt2 = t2; }
+    }
+  }
+  return [bt1, bt2];
+}
+
+function computeThresholds(gray, maskArr, target=[0.25,0.35,0.40], blend=0.5){
+  const {hist, total} = grayHistogram(gray, maskArr);
+  const [t1o, t2o] = otsu3FromHist(hist, total);
+  if (!target) return [t1o, t2o];
+  const [d, mv] = target;
+  const p1 = percentileFromHist(hist, total, d*100);
+  const p2 = percentileFromHist(hist, total, (d+mv)*100);
+  let t1 = Math.round((1-blend)*t1o + blend*p1);
+  let t2 = Math.round((1-blend)*t2o + blend*p2);
+  t2 = Math.max(t2, t1+12);
+  return [t1, t2];
+}
+
+const DISK_OFFSETS = (() => {
+  const offs = [];
+  for (let dy=-2; dy<=2; dy++){
+    for (let dx=-2; dx<=2; dx++){
+      if (Math.abs(dy)===2 && Math.abs(dx)===2) continue;
+      offs.push([dy,dx]);
+    }
+  }
+  return offs;
+})();
+
+function erode(mask, width, height){
+  const out = new Uint8Array(width*height);
+  for (let y=0;y<height;y++){
+    for (let x=0;x<width;x++){
+      let all = true;
+      for (const [dy,dx] of DISK_OFFSETS){
+        const ny=y+dy, nx=x+dx;
+        if (ny<0||ny>=height||nx<0||nx>=width || !mask[ny*width+nx]){ all=false; break; }
+      }
+      out[y*width+x] = all ? 1 : 0;
+    }
+  }
+  return out;
+}
+function dilate(mask, width, height){
+  const out = new Uint8Array(width*height);
+  for (let y=0;y<height;y++){
+    for (let x=0;x<width;x++){
+      let any = false;
+      for (const [dy,dx] of DISK_OFFSETS){
+        const ny=y+dy, nx=x+dx;
+        if (ny>=0&&ny<height&&nx>=0&&nx<width && mask[ny*width+nx]){ any=true; break; }
+      }
+      out[y*width+x] = any ? 1 : 0;
+    }
+  }
+  return out;
+}
+
+function labelComponents(mask, width, height){
+  const n = width*height;
+  const labels = new Int32Array(n).fill(-1);
+  const sizes = [];
+  const stack = new Int32Array(n);
+  let nextLabel = 0;
+  for (let start=0; start<n; start++){
+    if (!mask[start] || labels[start] !== -1) continue;
+    let sp = 0;
+    stack[sp++] = start;
+    labels[start] = nextLabel;
+    let size = 0;
+    while (sp > 0){
+      const idx = stack[--sp];
+      size++;
+      const x = idx % width, y = (idx - x)/width;
+      if (x>0){ const nidx=idx-1; if (mask[nidx] && labels[nidx]===-1){ labels[nidx]=nextLabel; stack[sp++]=nidx; } }
+      if (x<width-1){ const nidx=idx+1; if (mask[nidx] && labels[nidx]===-1){ labels[nidx]=nextLabel; stack[sp++]=nidx; } }
+      if (y>0){ const nidx=idx-width; if (mask[nidx] && labels[nidx]===-1){ labels[nidx]=nextLabel; stack[sp++]=nidx; } }
+      if (y<height-1){ const nidx=idx+width; if (mask[nidx] && labels[nidx]===-1){ labels[nidx]=nextLabel; stack[sp++]=nidx; } }
+    }
+    sizes.push(size);
+    nextLabel++;
+  }
+  return {labels, sizes, count: nextLabel};
+}
+
+function dropSmall(mask, width, height, minArea, fillHoles=true){
+  const m = mask.slice();
+  const {labels, sizes} = labelComponents(m, width, height);
+  for (let i=0;i<m.length;i++){
+    const lab = labels[i];
+    if (lab >= 0 && sizes[lab] < minArea) m[i] = 0;
+  }
+  if (fillHoles){
+    const inv = new Uint8Array(m.length);
+    for (let i=0;i<m.length;i++) inv[i] = m[i] ? 0 : 1;
+    const {labels: labels2, sizes: sizes2} = labelComponents(inv, width, height);
+    for (let i=0;i<m.length;i++){
+      const lab = labels2[i];
+      if (lab >= 0 && sizes2[lab] < minArea) m[i] = 1;
+    }
+  }
+  return m;
+}
+
+function cleanMask(mask, width, height, minArea, iterations=2){
+  let m = mask;
+  for (let i=0;i<iterations;i++) m = erode(m, width, height);
+  for (let i=0;i<iterations;i++) m = dilate(m, width, height);
+  return dropSmall(m, width, height, minArea, true);
+}
+
+// Fast separable box blur — used as the "smooth hard" pre-processing step
+// (approximates the median+gaussian combo; a true sliding median at full
+// photo resolution would be too slow for on-demand exports).
+function boxBlur(data, width, height, radius){
+  if (radius <= 0) return new Uint8ClampedArray(data);
+  const tmp = new Float32Array(data.length);
+  const out = new Uint8ClampedArray(data.length);
+  const size = radius * 2 + 1;
+  for (let y = 0; y < height; y++){
+    const rowOff = y * width * 4;
+    for (let c = 0; c < 4; c++){
+      let sum = 0;
+      for (let x = -radius; x <= radius; x++){
+        const xx = Math.min(width - 1, Math.max(0, x));
+        sum += data[rowOff + xx * 4 + c];
+      }
+      for (let x = 0; x < width; x++){
+        tmp[rowOff + x * 4 + c] = sum / size;
+        const xOutC = Math.min(width - 1, Math.max(0, x - radius));
+        const xInC = Math.min(width - 1, Math.max(0, x + radius + 1));
+        sum += data[rowOff + xInC * 4 + c] - data[rowOff + xOutC * 4 + c];
+      }
+    }
+  }
+  for (let x = 0; x < width; x++){
+    for (let c = 0; c < 4; c++){
+      let sum = 0;
+      for (let y = -radius; y <= radius; y++){
+        const yy = Math.min(height - 1, Math.max(0, y));
+        sum += tmp[(yy * width + x) * 4 + c];
+      }
+      for (let y = 0; y < height; y++){
+        out[(y * width + x) * 4 + c] = sum / size;
+        const yOutC = Math.min(height - 1, Math.max(0, y - radius));
+        const yInC = Math.min(height - 1, Math.max(0, y + radius + 1));
+        sum += tmp[(yInC * width + x) * 4 + c] - tmp[(yOutC * width + x) * 4 + c];
+      }
+    }
+  }
+  return out;
+}
+
+function analyseTones(rgba, width, height, maskArr, opts){
+  const {smoothRadius, targetSplit, blend, minAreaFrac, morphIterations} = opts;
+  const blurred1 = boxBlur(rgba, width, height, smoothRadius);
+  const blurred2 = boxBlur(blurred1, width, height, Math.ceil(smoothRadius/2));
+  const gray = computeGray(blurred2, width, height);
+  const [t1, t2] = computeThresholds(gray, maskArr, targetSplit, blend);
+
+  const n = width*height;
+  let dark = new Uint8Array(n), midplus = new Uint8Array(n);
+  for (let i=0;i<n;i++){
+    const inSubject = !maskArr || maskArr[i] > 128;
+    dark[i] = (inSubject && gray[i] < t1) ? 1 : 0;
+    midplus[i] = (inSubject && gray[i] < t2) ? 1 : 0;
+  }
+  const minArea = Math.max(4, Math.round(minAreaFrac*width*height));
+  dark = cleanMask(dark, width, height, minArea, morphIterations);
+  midplus = cleanMask(midplus, width, height, minArea, morphIterations);
+  for (let i=0;i<n;i++) if (dark[i]) midplus[i] = 1;
+
+  const idx = new Uint8Array(n).fill(2);
+  for (let i=0;i<n;i++){
+    if (midplus[i]) idx[i] = 1;
+    if (dark[i]) idx[i] = 0;
+  }
+  return {idx, width, height, thresholds: [t1, t2]};
+}
+
+function idxToImageData(idx, palette, width, height, maskArr){
+  const out = new ImageData(width, height);
+  for (let i=0;i<width*height;i++){
+    const c = palette[idx[i]];
+    const o = i*4;
+    out.data[o]=c[0]; out.data[o+1]=c[1]; out.data[o+2]=c[2];
+    out.data[o+3] = (maskArr && maskArr[i] <= 128) ? 0 : 255;
+  }
+  return out;
+}
+
+function rgbToHex(c){
+  const h = v => Math.round(v).toString(16).padStart(2, '0');
+  return '#' + h(c[0]) + h(c[1]) + h(c[2]);
+}
+
+// ============================================================================
+// App
+// ============================================================================
 (function(){
   const dropzone = document.getElementById('dropzone');
   const fileInput = document.getElementById('fileInput');
@@ -137,31 +555,38 @@
   const resultCanvas = document.getElementById('resultCanvas');
   const fullWorkCanvas = document.getElementById('fullWorkCanvas');
   const previewWorkCanvas = document.getElementById('previewWorkCanvas');
+  const hueThumbCanvas = document.getElementById('hueThumbCanvas');
   const swatchesEl = document.getElementById('swatches');
   const statusEl = document.getElementById('status');
-  const blurSlider = document.getElementById('blur');
+  const smoothSlider = document.getElementById('smooth');
   const despeckleSlider = document.getElementById('despeckle');
-  const blurVal = document.getElementById('blurVal');
+  const smoothVal = document.getElementById('smoothVal');
   const despeckleVal = document.getElementById('despeckleVal');
   const reprocessBtn = document.getElementById('reprocess');
   const downloadFullBtn = document.getElementById('downloadFull');
   const layerBtns = [document.getElementById('downloadLayer0'), document.getElementById('downloadLayer1'), document.getElementById('downloadLayer2')];
   const hiddenLink = document.getElementById('hiddenLink');
   const subjectToggle = document.getElementById('subjectOnly');
+  const contactSheetEl = document.getElementById('contactSheet');
+  const hueSlider = document.getElementById('hueSlider');
+  const hueVal = document.getElementById('hueVal');
 
-  const K = 3;
   const PREVIEW_MAX_DIM = 640;
-  const FULL_MAX_DIM = 2600;
-  const MASK_THRESHOLD = 128; // alpha value above which a pixel counts as "subject"
+  const FULL_MAX_DIM = 2000;
+  const MASK_THRESHOLD = 128;
   const BG_MODEL_URL = 'https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.7.0/dist/index.mjs';
 
-  let fullImageData = null;   // ImageData at (capped) full resolution
-  let previewImageData = null; // ImageData at preview resolution
-  let lastCentroids = null;   // [[r,g,b], ...] sorted by luminance
-  let lastPreviewLabels = null;
-  let fullMask = null;        // Uint8Array alpha mask (0-255) aligned to fullImageData, or null
-  let previewMask = null;     // Uint8Array alpha mask aligned to previewImageData, or null
+  let fullImageData = null;
+  let previewImageData = null;
+  let fullMask = null;
+  let previewMask = null;
   let isSegmenting = false;
+
+  let analysisPreview = null;   // {idx, width, height, thresholds}
+  let hueAuto = null;
+  let currentHue = 210;
+  let currentPalette = buildPalette(210);
+  let contactHues = contactHueList(null);
 
   function setStatus(msg){ statusEl.classList.remove('error'); statusEl.textContent = msg || ''; }
   function setStatusError(msg){ statusEl.classList.add('error'); statusEl.textContent = msg || ''; }
@@ -200,7 +625,6 @@
   function onImageLoaded(img){
     workArea.classList.remove('hidden');
 
-    // full-res (capped) buffer
     let fw = img.naturalWidth, fh = img.naturalHeight;
     const fScale = Math.min(1, FULL_MAX_DIM / Math.max(fw, fh));
     fw = Math.round(fw * fScale); fh = Math.round(fh * fScale);
@@ -209,7 +633,6 @@
     fctx.drawImage(img, 0, 0, fw, fh);
     fullImageData = fctx.getImageData(0, 0, fw, fh);
 
-    // preview buffer
     let pw = fw, ph = fh;
     const pScale = Math.min(1, PREVIEW_MAX_DIM / Math.max(pw, ph));
     pw = Math.round(pw * pScale); ph = Math.round(ph * pScale);
@@ -223,11 +646,12 @@
 
     fullMask = null;
     previewMask = null;
+    analysisPreview = null;
 
     if (subjectToggle.checked){
       runSubjectExtraction();
     } else {
-      process();
+      runAnalysis();
     }
   }
 
@@ -263,9 +687,7 @@
       }
 
       const bmp = await createImageBitmap(resultBlob);
-      console.log('[stencil-maker] segmentation result size', bmp.width, 'x', bmp.height, 'expected', fullWorkCanvas.width, 'x', fullWorkCanvas.height);
 
-      // full-resolution alpha mask
       const fw = fullWorkCanvas.width, fh = fullWorkCanvas.height;
       const mc = document.createElement('canvas');
       mc.width = fw; mc.height = fh;
@@ -278,7 +700,6 @@
         if (newFullMask[i] > MASK_THRESHOLD) subjectCount++;
       }
       const subjectFraction = subjectCount / newFullMask.length;
-      console.log('[stencil-maker] subject coverage:', (subjectFraction * 100).toFixed(1) + '%');
 
       if (subjectFraction < 0.01){
         throw new Error('almost nothing was detected as the subject (' + (subjectFraction*100).toFixed(1) + '% of the image) — the photo may be too low-contrast for auto-detection');
@@ -286,7 +707,6 @@
 
       fullMask = newFullMask;
 
-      // preview-resolution alpha mask
       const pw = previewImageData.width, ph = previewImageData.height;
       const pc = document.createElement('canvas');
       pc.width = pw; pc.height = ph;
@@ -297,284 +717,192 @@
 
       isSegmenting = false;
       setBusy(false);
-      setStatus('Subject detected (' + (subjectFraction*100).toFixed(0) + '% of frame). Rendering stencil…');
-      process();
+      setStatus('Subject detected (' + (subjectFraction*100).toFixed(0) + '% of frame). Analysing tones…');
+      runAnalysis();
     } catch (err){
       console.error('[stencil-maker] subject extraction failed:', err);
       isSegmenting = false;
       setBusy(false);
       fullMask = null; previewMask = null;
       setStatusError('Subject detection failed: ' + err.message + '. Showing the full photo instead — check the browser console for details, or try again.');
-      process();
+      runAnalysis();
     }
   }
 
-  function sampleColorsMasked(data, width, height, maxSamples, mask, threshold){
-    const total = width * height;
-    const indices = [];
-    for (let i = 0; i < total; i++){
-      if (mask[i] > threshold) indices.push(i);
-    }
-    if (indices.length === 0) return [];
-    const stride = Math.max(1, Math.floor(indices.length / maxSamples));
-    const samples = [];
-    for (let j = 0; j < indices.length; j += stride){
-      const o = indices[j] * 4;
-      samples.push([data[o], data[o+1], data[o+2]]);
-    }
-    return samples;
-  }
-
-  function applyAlphaMask(imageData, mask, threshold){
-    for (let i = 0; i < mask.length; i++){
-      if (mask[i] <= threshold) imageData.data[i * 4 + 3] = 0;
-    }
-  }
-
-  // ---------- image processing primitives ----------
-
-  // Fast separable box blur (approximates gaussian), operates on RGBA Uint8ClampedArray copy.
-  function boxBlur(data, width, height, radius){
-    if (radius <= 0) return new Uint8ClampedArray(data);
-    const tmp = new Float32Array(data.length);
-    const out = new Uint8ClampedArray(data.length);
-    const size = radius * 2 + 1;
-
-    for (let y = 0; y < height; y++){
-      const rowOff = y * width * 4;
-      for (let c = 0; c < 4; c++){
-        let sum = 0;
-        for (let x = -radius; x <= radius; x++){
-          const xx = Math.min(width - 1, Math.max(0, x));
-          sum += data[rowOff + xx * 4 + c];
-        }
-        for (let x = 0; x < width; x++){
-          tmp[rowOff + x * 4 + c] = sum / size;
-          const xOutC = Math.min(width - 1, Math.max(0, x - radius));
-          const xInC = Math.min(width - 1, Math.max(0, x + radius + 1));
-          sum += data[rowOff + xInC * 4 + c] - data[rowOff + xOutC * 4 + c];
-        }
-      }
-    }
-    for (let x = 0; x < width; x++){
-      for (let c = 0; c < 4; c++){
-        let sum = 0;
-        for (let y = -radius; y <= radius; y++){
-          const yy = Math.min(height - 1, Math.max(0, y));
-          sum += tmp[(yy * width + x) * 4 + c];
-        }
-        for (let y = 0; y < height; y++){
-          out[(y * width + x) * 4 + c] = sum / size;
-          const yOutC = Math.min(height - 1, Math.max(0, y - radius));
-          const yInC = Math.min(height - 1, Math.max(0, y + radius + 1));
-          sum += tmp[(yInC * width + x) * 4 + c] - tmp[(yOutC * width + x) * 4 + c];
-        }
-      }
-    }
-    return out;
-  }
-
-  function colorDist2(a, b){
-    const dr = a[0]-b[0], dg = a[1]-b[1], db = a[2]-b[2];
-    return dr*dr + dg*dg + db*db;
-  }
-
-  function sampleColors(data, width, height, maxSamples){
-    const total = width * height;
-    const stride = Math.max(1, Math.floor(total / maxSamples));
-    const samples = [];
-    for (let i = 0; i < total; i += stride){
-      const o = i * 4;
-      samples.push([data[o], data[o+1], data[o+2]]);
-    }
-    return samples;
-  }
-
-  function kmeansPlusPlusInit(samples, k){
-    const centroids = [samples[Math.floor(Math.random() * samples.length)]];
-    while (centroids.length < k){
-      const dists = samples.map(p => {
-        let minD = Infinity;
-        for (const c of centroids){
-          const d = colorDist2(p, c);
-          if (d < minD) minD = d;
-        }
-        return minD;
-      });
-      const sum = dists.reduce((a,b) => a+b, 0);
-      if (sum <= 0){
-        centroids.push(samples[Math.floor(Math.random() * samples.length)]);
-        continue;
-      }
-      let r = Math.random() * sum;
-      let idx = 0;
-      for (; idx < dists.length; idx++){
-        r -= dists[idx];
-        if (r <= 0) break;
-      }
-      centroids.push(samples[Math.min(idx, samples.length - 1)]);
-    }
-    return centroids;
-  }
-
-  function kmeans(samples, k, iterations){
-    let centroids = kmeansPlusPlusInit(samples, k);
-    let assignments = new Array(samples.length).fill(0);
-
-    for (let iter = 0; iter < iterations; iter++){
-      for (let i = 0; i < samples.length; i++){
-        let best = 0, bestD = Infinity;
-        for (let c = 0; c < k; c++){
-          const d = colorDist2(samples[i], centroids[c]);
-          if (d < bestD){ bestD = d; best = c; }
-        }
-        assignments[i] = best;
-      }
-      const sums = Array.from({length: k}, () => [0,0,0,0]);
-      for (let i = 0; i < samples.length; i++){
-        const c = assignments[i], p = samples[i];
-        sums[c][0] += p[0]; sums[c][1] += p[1]; sums[c][2] += p[2]; sums[c][3] += 1;
-      }
-      centroids = sums.map((s, idx) => s[3] > 0 ? [s[0]/s[3], s[1]/s[3], s[2]/s[3]] : centroids[idx]);
-    }
-    return centroids;
-  }
-
-  function luminance(c){ return 0.299*c[0] + 0.587*c[1] + 0.114*c[2]; }
-
-  function classify(data, width, height, centroids){
-    const labels = new Uint8Array(width * height);
-    for (let i = 0; i < width * height; i++){
-      const o = i * 4;
-      const p = [data[o], data[o+1], data[o+2]];
-      let best = 0, bestD = Infinity;
-      for (let c = 0; c < centroids.length; c++){
-        const d = colorDist2(p, centroids[c]);
-        if (d < bestD){ bestD = d; best = c; }
-      }
-      labels[i] = best;
-    }
-    return labels;
-  }
-
-  function majorityFilter(labels, width, height, k, iterations){
-    if (iterations <= 0) return labels;
-    let src = labels;
-    for (let it = 0; it < iterations; it++){
-      const dst = new Uint8Array(width * height);
-      for (let y = 0; y < height; y++){
-        for (let x = 0; x < width; x++){
-          const counts = new Array(k).fill(0);
-          for (let dy = -1; dy <= 1; dy++){
-            const ny = y + dy;
-            if (ny < 0 || ny >= height) continue;
-            for (let dx = -1; dx <= 1; dx++){
-              const nx = x + dx;
-              if (nx < 0 || nx >= width) continue;
-              counts[src[ny * width + nx]]++;
-            }
-          }
-          let best = 0, bestC = -1;
-          for (let c = 0; c < k; c++){
-            if (counts[c] > bestC){ bestC = counts[c]; best = c; }
-          }
-          dst[y * width + x] = best;
-        }
-      }
-      src = dst;
-    }
-    return src;
-  }
-
-  function labelsToImageData(labels, centroids, width, height){
-    const out = new ImageData(width, height);
-    for (let i = 0; i < width * height; i++){
-      const c = centroids[labels[i]];
-      const o = i * 4;
-      out.data[o] = c[0]; out.data[o+1] = c[1]; out.data[o+2] = c[2]; out.data[o+3] = 255;
-    }
-    return out;
-  }
-
-  function rgbToHex(c){
-    const h = v => Math.round(v).toString(16).padStart(2, '0');
-    return '#' + h(c[0]) + h(c[1]) + h(c[2]);
-  }
-
-  // ---------- main preview pipeline ----------
-  function process(){
-    if (!previewImageData) return;
-    setStatus('Processing preview…');
-    const width = previewImageData.width, height = previewImageData.height;
-    const blurRadius = parseInt(blurSlider.value, 10);
-    const despeckleIters = parseInt(despeckleSlider.value, 10);
-
-    const useMask = subjectToggle.checked && previewMask;
-
-    const blurred = boxBlur(previewImageData.data, width, height, blurRadius);
-    let samples = useMask
-      ? sampleColorsMasked(blurred, width, height, 6000, previewMask, MASK_THRESHOLD)
-      : sampleColors(blurred, width, height, 6000);
-    if (samples.length < K) samples = sampleColors(blurred, width, height, 6000);
-    const centroids = kmeans(samples, K, 8).sort((a,b) => luminance(a) - luminance(b));
-
-    let labels = classify(blurred, width, height, centroids);
-    labels = majorityFilter(labels, width, height, K, despeckleIters);
-
-    const outData = labelsToImageData(labels, centroids, width, height);
-    if (useMask) applyAlphaMask(outData, previewMask, MASK_THRESHOLD);
-    resultCanvas.width = width; resultCanvas.height = height;
-    resultCanvas.getContext('2d').putImageData(outData, 0, 0);
-
-    lastCentroids = centroids;
-    lastPreviewLabels = labels;
-    renderSwatches(labels, centroids, useMask ? previewMask : null);
-    setStatus(useMask
-      ? 'Preview updated (background removed). Adjust sliders or download below.'
-      : 'Preview updated. Adjust sliders and click "Re-render preview", or download below.');
-  }
-
-  function renderSwatches(labels, centroids, mask){
-    const counts = new Array(centroids.length).fill(0);
-    let total = 0;
-    for (let i = 0; i < labels.length; i++){
-      if (mask && mask[i] <= MASK_THRESHOLD) continue;
-      counts[labels[i]]++;
-      total++;
-    }
-    if (total === 0) total = labels.length;
-    swatchesEl.innerHTML = '';
-    centroids.forEach((c, idx) => {
-      const pct = (100 * counts[idx] / total).toFixed(1);
-      const div = document.createElement('div');
-      div.className = 'swatch';
-      div.innerHTML = '<div class="chip" style="background:' + rgbToHex(c) + '"></div>' +
-        '<div class="info"><b>Layer ' + (idx+1) + '</b><br>' + rgbToHex(c) + ' · ' + pct + '% of subject</div>';
-      swatchesEl.appendChild(div);
-    });
-  }
-
-  blurSlider.addEventListener('input', () => { blurVal.textContent = blurSlider.value; });
-  despeckleSlider.addEventListener('input', () => { despeckleVal.textContent = despeckleSlider.value; });
-  reprocessBtn.addEventListener('click', process);
   subjectToggle.addEventListener('change', () => {
     if (!fullImageData) return;
     if (subjectToggle.checked && !fullMask){
       runSubjectExtraction();
     } else {
-      process();
+      runAnalysis();
     }
   });
 
+  // ---------- accent hue (from a small thumbnail of the ORIGINAL photo) ----------
+  function maskToThumbnail(mask, srcW, srcH, tw, th){
+    const srcCanvas = document.createElement('canvas');
+    srcCanvas.width = srcW; srcCanvas.height = srcH;
+    const sctx = srcCanvas.getContext('2d');
+    const maskImgData = sctx.createImageData(srcW, srcH);
+    for (let i=0;i<mask.length;i++) maskImgData.data[i*4+3] = mask[i];
+    sctx.putImageData(maskImgData, 0, 0);
+    const dst = document.createElement('canvas');
+    dst.width = tw; dst.height = th;
+    dst.getContext('2d').drawImage(srcCanvas, 0, 0, tw, th);
+    const d = dst.getContext('2d').getImageData(0, 0, tw, th).data;
+    const out = new Uint8Array(tw*th);
+    for (let i=0;i<out.length;i++) out[i] = d[i*4+3];
+    return out;
+  }
+
+  function computeAccentHue(){
+    const sw = fullWorkCanvas.width, sh = fullWorkCanvas.height;
+    const maxDim = 320;
+    const scale = Math.min(1, maxDim/Math.max(sw,sh));
+    const tw = Math.max(1, Math.round(sw*scale)), th = Math.max(1, Math.round(sh*scale));
+    hueThumbCanvas.width = tw; hueThumbCanvas.height = th;
+    const hctx = hueThumbCanvas.getContext('2d');
+    hctx.drawImage(fullWorkCanvas, 0, 0, tw, th);
+    const thumbData = hctx.getImageData(0, 0, tw, th);
+
+    const useMask = subjectToggle.checked && fullMask;
+    let sampleOpts;
+    if (useMask){
+      const maskThumb = maskToThumbnail(fullMask, sw, sh, tw, th);
+      sampleOpts = {x0:0, y0:0, x1:tw, y1:th, maskArr: maskThumb};
+    } else {
+      const cw = Math.round(tw*0.75), ch = Math.round(th*0.75);
+      const x0 = Math.floor((tw-cw)/2), y0 = Math.floor((th-ch)/2);
+      sampleOpts = {x0, y0, x1:x0+cw, y1:y0+ch};
+    }
+    const samples = buildHueSamples(thumbData.data, tw, th, sampleOpts);
+    return accentHueFromSamples(samples);
+  }
+
+  // ---------- main analysis pipeline (the expensive step, run once per photo/settings) ----------
+  function runAnalysis(){
+    if (!previewImageData) return;
+    setStatus('Analysing tones…');
+
+    const smoothRadius = parseInt(smoothSlider.value, 10);
+    const despeckle = parseInt(despeckleSlider.value, 10);
+    const minAreaFrac = 0.0003 + despeckle*0.00015;
+    const useMask = subjectToggle.checked && previewMask;
+
+    analysisPreview = analyseTones(
+      previewImageData.data, previewImageData.width, previewImageData.height,
+      useMask ? previewMask : null,
+      { smoothRadius, targetSplit:[0.25,0.35,0.40], blend:0.5, minAreaFrac, morphIterations: despeckle }
+    );
+
+    hueAuto = computeAccentHue();
+    currentHue = (hueAuto === null) ? 210 : hueAuto;
+    contactHues = contactHueList(hueAuto);
+    hueSlider.value = Math.round(currentHue);
+    hueVal.textContent = Math.round(currentHue) + '°';
+
+    renderContactSheet();
+    renderMainPreview();
+
+    setStatus(
+      (hueAuto === null ? 'No dominant color detected — ' : 'Auto-hue: ' + Math.round(hueAuto) + '°. ') +
+      'Pick a palette below, or drag the hue slider.'
+    );
+  }
+
+  function renderMainPreview(){
+    if (!analysisPreview) return;
+    currentPalette = buildPalette(currentHue);
+    const useMask = subjectToggle.checked && previewMask;
+    const outData = idxToImageData(analysisPreview.idx, currentPalette, analysisPreview.width, analysisPreview.height, useMask ? previewMask : null);
+    resultCanvas.width = analysisPreview.width; resultCanvas.height = analysisPreview.height;
+    resultCanvas.getContext('2d').putImageData(outData, 0, 0);
+    renderSwatches(analysisPreview.idx, currentPalette, useMask ? previewMask : null);
+  }
+
+  function renderSwatches(idx, palette, mask){
+    const counts = [0,0,0];
+    let total = 0;
+    for (let i=0;i<idx.length;i++){
+      if (mask && mask[i] <= MASK_THRESHOLD) continue;
+      counts[idx[i]]++;
+      total++;
+    }
+    if (total === 0) total = idx.length;
+    const names = ['Dark', 'Mid', 'Light'];
+    swatchesEl.innerHTML = '';
+    palette.forEach((c, i) => {
+      const pct = (100 * counts[i] / total).toFixed(1);
+      const div = document.createElement('div');
+      div.className = 'swatch';
+      div.innerHTML = '<div class="chip" style="background:' + rgbToHex(c) + '"></div>' +
+        '<div class="info"><b>Layer ' + (i+1) + ' (' + names[i] + ')</b><br>' + rgbToHex(c) + ' · ' + pct + '% of subject</div>';
+      swatchesEl.appendChild(div);
+    });
+  }
+
+  function renderContactSheet(){
+    if (!analysisPreview) return;
+    contactSheetEl.innerHTML = '';
+    const useMask = subjectToggle.checked && previewMask;
+    contactHues.forEach((h) => {
+      const pal = buildPalette(h);
+      const data = idxToImageData(analysisPreview.idx, pal, analysisPreview.width, analysisPreview.height, useMask ? previewMask : null);
+      const full = document.createElement('canvas');
+      full.width = analysisPreview.width; full.height = analysisPreview.height;
+      full.getContext('2d').putImageData(data, 0, 0);
+
+      const tile = document.createElement('div');
+      const isSelected = Math.abs(((h - currentHue + 180) % 360 + 360) % 360 - 180) < 0.6;
+      tile.className = 'palette-tile' + (isSelected ? ' selected' : '');
+
+      const thumbCanvas = document.createElement('canvas');
+      const maxT = 150;
+      const scale = Math.min(1, maxT/Math.max(full.width, full.height));
+      thumbCanvas.width = Math.max(1, Math.round(full.width*scale));
+      thumbCanvas.height = Math.max(1, Math.round(full.height*scale));
+      thumbCanvas.getContext('2d').drawImage(full, 0, 0, thumbCanvas.width, thumbCanvas.height);
+      tile.appendChild(thumbCanvas);
+
+      const label = document.createElement('div');
+      label.className = 'palette-tile-label';
+      label.textContent = Math.round(h) + '°';
+      tile.appendChild(label);
+
+      tile.addEventListener('click', () => {
+        currentHue = h;
+        hueSlider.value = Math.round(h);
+        hueVal.textContent = Math.round(h) + '°';
+        renderMainPreview();
+        Array.from(contactSheetEl.children).forEach(c => c.classList.remove('selected'));
+        tile.classList.add('selected');
+      });
+
+      contactSheetEl.appendChild(tile);
+    });
+  }
+
+  smoothSlider.addEventListener('input', () => { smoothVal.textContent = smoothSlider.value; });
+  despeckleSlider.addEventListener('input', () => { despeckleVal.textContent = despeckleSlider.value; });
+  reprocessBtn.addEventListener('click', runAnalysis);
+  hueSlider.addEventListener('input', () => {
+    currentHue = parseFloat(hueSlider.value);
+    hueVal.textContent = Math.round(currentHue) + '°';
+    renderMainPreview();
+    Array.from(contactSheetEl.children).forEach(c => c.classList.remove('selected'));
+  });
+
   // ---------- full-resolution export ----------
-  function buildFullResLabels(){
-    const width = fullImageData.width, height = fullImageData.height;
-    const blurRadius = parseInt(blurSlider.value, 10);
-    const despeckleIters = parseInt(despeckleSlider.value, 10);
-    const blurred = boxBlur(fullImageData.data, width, height, blurRadius);
-    let labels = classify(blurred, width, height, lastCentroids);
-    labels = majorityFilter(labels, width, height, K, despeckleIters);
-    return { labels, width, height };
+  function buildFullResAnalysis(){
+    const smoothRadius = parseInt(smoothSlider.value, 10);
+    const despeckle = parseInt(despeckleSlider.value, 10);
+    const minAreaFrac = 0.0003 + despeckle*0.00015;
+    const useMask = subjectToggle.checked && fullMask;
+    return analyseTones(
+      fullImageData.data, fullImageData.width, fullImageData.height,
+      useMask ? fullMask : null,
+      { smoothRadius, targetSplit:[0.25,0.35,0.40], blend:0.5, minAreaFrac, morphIterations: despeckle }
+    );
   }
 
   function triggerDownload(canvas, filename){
@@ -588,41 +916,40 @@
   }
 
   downloadFullBtn.addEventListener('click', () => {
-    if (!lastCentroids) return;
+    if (!analysisPreview) return;
     const useMask = subjectToggle.checked && fullMask;
     setStatus('Rendering full-resolution stencil… this can take a few seconds.');
     setTimeout(() => {
-      const { labels, width, height } = buildFullResLabels();
-      const outData = labelsToImageData(labels, lastCentroids, width, height);
-      if (useMask) applyAlphaMask(outData, fullMask, MASK_THRESHOLD);
+      const a = buildFullResAnalysis();
+      const outData = idxToImageData(a.idx, currentPalette, a.width, a.height, useMask ? fullMask : null);
       const c = document.createElement('canvas');
-      c.width = width; c.height = height;
+      c.width = a.width; c.height = a.height;
       c.getContext('2d').putImageData(outData, 0, 0);
       triggerDownload(c, 'stencil-3color.png');
       setStatus('Full-resolution stencil downloaded.');
     }, 30);
   });
 
-  layerBtns.forEach((btn, idx) => {
+  layerBtns.forEach((btn, idxNum) => {
     btn.addEventListener('click', () => {
-      if (!lastCentroids) return;
+      if (!analysisPreview) return;
       const useMask = subjectToggle.checked && fullMask;
-      setStatus('Rendering layer ' + (idx+1) + ' mask… this can take a few seconds.');
+      setStatus('Rendering layer ' + (idxNum+1) + ' mask… this can take a few seconds.');
       setTimeout(() => {
-        const { labels, width, height } = buildFullResLabels();
-        const out = new ImageData(width, height);
-        for (let i = 0; i < width * height; i++){
+        const a = buildFullResAnalysis();
+        const out = new ImageData(a.width, a.height);
+        for (let i = 0; i < a.width * a.height; i++){
           const outsideSubject = useMask && fullMask[i] <= MASK_THRESHOLD;
-          const isLayer = labels[i] === idx && !outsideSubject;
+          const isLayer = a.idx[i] === idxNum && !outsideSubject;
           const v = isLayer ? 0 : 255;
           const o = i * 4;
           out.data[o] = v; out.data[o+1] = v; out.data[o+2] = v; out.data[o+3] = 255;
         }
         const c = document.createElement('canvas');
-        c.width = width; c.height = height;
+        c.width = a.width; c.height = a.height;
         c.getContext('2d').putImageData(out, 0, 0);
-        triggerDownload(c, 'stencil-layer-' + (idx+1) + '.png');
-        setStatus('Layer ' + (idx+1) + ' mask downloaded.');
+        triggerDownload(c, 'stencil-layer-' + (idxNum+1) + '.png');
+        setStatus('Layer ' + (idxNum+1) + ' mask downloaded.');
       }, 30);
     });
   });
